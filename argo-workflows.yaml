@@ -1,0 +1,104 @@
+apiVersion: argoproj.io/v1alpha1
+kind: Workflow
+metadata:
+  generateName: buildah-ci-
+spec:
+  entrypoint: build-push
+  arguments:
+    parameters:
+    - name: repo-url
+    - name: image
+    - name: branch
+      value: "main"
+    - name: dockerfile
+      value: "Containerfile"
+
+  volumeClaimTemplates:
+  - metadata:
+      name: workdir
+    spec:
+      accessModes: ["ReadWriteOnce"]
+      resources:
+        requests:
+          storage: 100Mi
+
+  volumes:
+    - name: quay-config
+      secret:
+        secretName: quay-creds
+        items:
+          - key: .dockerconfigjson
+            path: config.json
+
+  templates:
+  - name: build-push
+    inputs:
+      parameters:
+      - name: repo-url
+      - name: branch
+      - name: image
+      - name: dockerfile
+    steps:
+    - - name: git-clone
+        template: git-clone
+        arguments:
+          parameters:
+          - name: repo-url
+            value: "{{ inputs.parameters.repo-url }}"
+          - name: branch
+            value: "{{ inputs.parameters.branch }}"
+    - - name: image-build
+        template: image-build
+        arguments:
+          parameters:
+          - name: image
+            value: "{{ inputs.parameters.image }}"
+          - name: dockerfile
+            value: "{{ inputs.parameters.dockerfile }}"
+          - name: commit-sha
+            value: "{{ steps.git-clone.outputs.parameters.commit-sha }}"
+
+  - name: git-clone
+    inputs:
+      parameters:
+      - name: repo-url
+      - name: branch
+    container:
+      image: alpine/git
+      command: [sh, -c]
+      args:
+      - |
+        git clone --branch "{{ inputs.parameters.branch }}" "{{ inputs.parameters.repo-url }}" /source
+        cd /source
+        COMMIT_SHA=$(git rev-parse --short HEAD)
+        echo -n "$COMMIT_SHA" > /source/commit-sha.txt
+      volumeMounts:
+      - name: workdir
+        mountPath: /source
+    outputs:
+      parameters:
+      - name: commit-sha
+        valueFrom:
+          path: /source/commit-sha.txt
+
+  - name: image-build
+    inputs:
+      parameters:
+      - name: image
+      - name: dockerfile
+      - name: commit-sha
+    container:
+      image: quay.io/buildah/stable:latest
+      securityContext:
+        privileged: true
+      command: [sh, -c]
+      args:
+      - |
+        echo "Building and pushing image with tag: {{ inputs.parameters.commit-sha }}"
+        buildah bud --authfile .quay/config.json -f /source/{{inputs.parameters.dockerfile}} -t {{inputs.parameters.image}}:{{inputs.parameters.commit-sha}} /source
+        buildah push --authfile .quay/config.json {{ inputs.parameters.image }}:{{ inputs.parameters.commit-sha }}
+      volumeMounts:
+        - name: workdir
+          mountPath: /source
+        - name: quay-config
+          mountPath: .quay
